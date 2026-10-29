@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------
+# FarAlpha VM Challenge - .gitignore
+# ---------------------------------------------------------------
+# Secrets and credentials - must NEVER be committed.
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.ppk
+.env
+.env.*
+secrets.*
+credentials
+*.secret
+.ssh/
+known_hosts
+*.token
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage artefacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+coverage.xml
+
+# Packaging artefacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Build / deploy artefacts produced locally
+*.zip
+releases/
+staging/
+artifacts/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Local deployment scratch directories
+deploy-local/

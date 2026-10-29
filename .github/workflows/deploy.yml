@@ -1,0 +1,262 @@
+# ---------------------------------------------------------------
+# FarAlpha VM Challenge - GitHub Actions deployment workflow
+# ---------------------------------------------------------------
+# Triggers:
+#   - Any push to the `main` branch.
+#   - Manual dispatch from the Actions tab.
+#
+# Required repository secrets:
+#   VM_HOST         Public IP / hostname of the Azure VM (e.g. 20.127.242.99)
+#   VM_USER         SSH username (azureuser)
+#   VM_SSH_KEY      Private SSH key (PEM format). Stored as a secret.
+#   VM_KNOWN_HOSTS  Output of `ssh-keyscan -H <VM_HOST>` (the known_hosts
+#                   entry). Prevents man-in-the-middle attacks.
+#
+# Security:
+#   - The SSH private key NEVER lives on the VM.
+#   - The private key is written to the runner's filesystem only for the
+#     duration of the job and is removed afterwards.
+#   - SSH host-key verification is NOT disabled.
+#   - Minimal permissions are requested for the GITHUB_TOKEN.
+#   - Third-party actions are pinned to full commit SHAs.
+# ---------------------------------------------------------------
+name: Deploy FarAlpha API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Concurrent deployments are queued (not run in parallel) - the latest
+# run cancels older pending runs but a run in progress is NOT cancelled,
+# preventing half-deployments.
+concurrency:
+  group: deploy-faralpha-api
+  cancel-in-progress: false
+
+# Minimal permissions - the workflow does NOT need to write to the
+# repository, only to read it. This is a critical security posture.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  VM_HOST: ${{ secrets.VM_HOST }}
+  VM_USER: ${{ secrets.VM_USER }}
+  # Short SHA used to version the artifact.
+  GIT_SHA: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Run unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 1. Check out the source code (pinned to a SHA).
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      # 2. Set up Python (pinned to a SHA).
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # 3. Install dependencies.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # 4. Run pytest (the application contract is validated here).
+      - name: Run pytest
+        run: |
+          pytest -v --tb=short --junitxml=pytest-results.xml
+        continue-on-error: false
+
+      # 5. Upload test results for visibility on the Actions UI.
+      - name: Upload pytest results
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  build-artifact:
+    name: Build deployment artifact
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 10
+    outputs:
+      artifact-path: ${{ steps.package.outputs.artifact_path }}
+      artifact-sha256: ${{ steps.package.outputs.artifact_sha256 }}
+      artifact-name: ${{ steps.package.outputs.artifact_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Package deployment artifact
+        id: package
+        run: |
+          VERSION="${GITHUB_RUN_NUMBER}-${GIT_SHA:0:8}"
+          bash scripts/package.sh artifacts "${VERSION}" "${GIT_SHA:0:8}"
+          # Export outputs for the next step.
+          TARBALL=$(ls artifacts/*.tar.gz | head -n1)
+          SHA256=$(cat "${TARBALL}.sha256")
+          echo "artifact_path=${TARBALL}" >> "$GITHUB_OUTPUT"
+          echo "artifact_sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$(basename "${TARBALL}")" >> "$GITHUB_OUTPUT"
+          echo "Built: ${TARBALL}"
+          echo "SHA256: ${SHA256}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: faralpha-api-artifact
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to VM via SSH
+    runs-on: ubuntu-latest
+    needs: build-artifact
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download deployment artifact
+        uses: actions/download-artifact@fa0a91b85a4b2ce705a4b340d5ba1f5d92696a30 # v4.1.8
+        with:
+          name: faralpha-api-artifact
+          path: artifacts
+
+      - name: Verify artifact checksum
+        env:
+          EXPECTED_SHA256: ${{ needs.build-artifact.outputs.artifact-sha256 }}
+        run: |
+          TARBALL=$(find artifacts -name '*.tar.gz' | head -n1)
+          if [[ -z "${TARBALL}" ]]; then
+            echo "ERROR: no artifact tarball found" >&2
+            exit 1
+          fi
+          ACTUAL_SHA256=$(sha256sum "${TARBALL}" | awk '{print $1}')
+          echo "Expected SHA256: ${EXPECTED_SHA256}"
+          echo "Actual   SHA256: ${ACTUAL_SHA256}"
+          if [[ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]]; then
+            echo "ERROR: checksum mismatch" >&2
+            exit 1
+          fi
+          echo "Checksum verified."
+          echo "TARBALL_PATH=${TARBALL}" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------
+      # SSH setup.
+      # The private key NEVER touches the VM. It lives only in the
+      # GitHub Actions runner's filesystem for the duration of this job.
+      # ----------------------------------------------------------------
+      - name: Configure SSH
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
+        run: |
+          if [[ -z "${VM_SSH_KEY}" ]]; then
+            echo "ERROR: VM_SSH_KEY secret is not set" >&2
+            exit 1
+          fi
+          if [[ -z "${VM_KNOWN_HOSTS}" ]]; then
+            echo "ERROR: VM_KNOWN_HOSTS secret is not set" >&2
+            echo "Obtain the host key with: ssh-keyscan -H <VM_HOST>" >&2
+            exit 1
+          fi
+          if [[ -z "${VM_HOST}" ]] || [[ -z "${VM_USER}" ]]; then
+            echo "ERROR: VM_HOST or VM_USER secret is not set" >&2
+            exit 1
+          fi
+          # Install the private key with restrictive permissions.
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${VM_SSH_KEY}" > ~/.ssh/vm_id
+          chmod 600 ~/.ssh/vm_id
+          # Install the known_hosts entry - this is REQUIRED for
+          # StrictHostKeyChecking to work without prompting.
+          printf '%s\n' "${VM_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          # Verify the known_hosts entry is parsable.
+          ssh-keygen -F "${VM_HOST}" -f ~/.ssh/known_hosts >/dev/null || {
+            echo "ERROR: VM_KNOWN_HOSTS does not contain an entry for ${VM_HOST}" >&2
+            exit 1
+          }
+          # Convenience variable for subsequent SSH / SCP commands.
+          echo "SSH_OPTS=-o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -i ~/.ssh/vm_id" >> "$GITHUB_ENV"
+          echo "SSH_TARGET=${VM_USER}@${VM_HOST}" >> "$GITHUB_ENV"
+
+      - name: Run prerequisite check on VM
+        env:
+          REMOTE_PREREQ_SCRIPT: scripts/check_prerequisites.sh
+        run: |
+          # Transfer the prerequisite checker to the VM temporarily.
+          scp ${SSH_OPTS} "${REMOTE_PREREQ_SCRIPT}" "${SSH_TARGET}":/tmp/check_prerequisites.sh
+          # Run it. Fail the workflow if any required prerequisite is missing.
+          ssh ${SSH_OPTS} "${SSH_TARGET}" "bash /tmp/check_prerequisites.sh"
+
+      - name: Transfer artifact to VM
+        run: |
+          REMOTE_PATH="/tmp/$(basename "${TARBALL_PATH}")"
+          scp ${SSH_OPTS} "${TARBALL_PATH}" "${SSH_TARGET}:${REMOTE_PATH}"
+          echo "REMOTE_ARTIFACT_PATH=${REMOTE_PATH}" >> "$GITHUB_ENV"
+
+      - name: Transfer remote_deploy.sh to VM
+        run: |
+          scp ${SSH_OPTS} scripts/remote_deploy.sh "${SSH_TARGET}":/tmp/remote_deploy.sh
+
+      - name: Transfer smoke_test.sh to VM
+        run: |
+          scp ${SSH_OPTS} scripts/smoke_test.sh "${SSH_TARGET}":/tmp/smoke_test.sh
+
+      - name: Execute remote deployment
+        env:
+          EXPECTED_SHA256: ${{ needs.build-artifact.outputs.artifact-sha256 }}
+        run: |
+          ssh ${SSH_OPTS} "${SSH_TARGET}" \
+            "bash /tmp/remote_deploy.sh ${REMOTE_ARTIFACT_PATH} ${EXPECTED_SHA256}"
+
+      - name: Run smoke test on deployed endpoint
+        run: |
+          ssh ${SSH_OPTS} "${SSH_TARGET}" \
+            "bash /tmp/smoke_test.sh ${VM_HOST}"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          # Always remove the private key, even if a step failed.
+          rm -f ~/.ssh/vm_id
+          # Optionally cleanup the remote staging file too.
+          ssh ${SSH_OPTS} "${SSH_TARGET}" \
+            "rm -f /tmp/check_prerequisites.sh /tmp/remote_deploy.sh /tmp/smoke_test.sh ${REMOTE_ARTIFACT_PATH:-}" 2>/dev/null || true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Deployment summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Artifact**: \`${{ needs.build-artifact.outputs.artifact-name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **SHA-256**: \`${{ needs.build-artifact.outputs.artifact-sha256 }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **VM host**: \`${{ secrets.VM_HOST }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Endpoint**: http://${{ secrets.VM_HOST }}/sayHello" >> "$GITHUB_STEP_SUMMARY"

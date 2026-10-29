@@ -1,0 +1,4 @@
+# FarAlpha VM Challenge - Python runtime dependencies
+# Pin minor versions for reproducibility while allowing patch updates.
+Flask==3.0.3
+gunicorn==23.0.0

@@ -1,0 +1,62 @@
+# ---------------------------------------------------------------
+# FarAlpha VM Challenge - systemd service unit
+# ---------------------------------------------------------------
+# Installed to: /etc/systemd/system/faralpha-api.service
+# Enabled via:  sudo systemctl enable --now faralpha-api
+# ---------------------------------------------------------------
+# This unit runs the Gunicorn WSGI server as the non-root azureuser
+# account. Gunicorn binds ONLY to 127.0.0.1:8000 - it is never
+# exposed to the public internet. Nginx on port 80 proxies inbound
+# requests to this socket.
+# ---------------------------------------------------------------
+
+[Unit]
+Description=FarAlpha VM Challenge - Gunicorn WSGI server
+Documentation=https://github.com/your-org/faralpha-vm-challenge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# Run as the non-root VM user (matches the SSH account).
+User=azureuser
+Group=azureuser
+
+# Resolve the venv and current release via the symlink that
+# remote_deploy.sh atomically swaps.
+WorkingDirectory=/opt/faralpha/current
+EnvironmentFile=-/opt/faralpha/current/.env
+ExecStart=/opt/faralpha/venv/bin/gunicorn \
+    --config /opt/faralpha/current/gunicorn.conf.py \
+    --pid /tmp/faralpha-api.pid \
+    "app:application"
+
+# Graceful shutdown - Gunicorn handles SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Auto-restart on crash with sane backoff.
+Restart=on-failure
+RestartSec=2s
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Hardening - drop capabilities that the app does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# Logging - stdout/stderr go to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=faralpha-api
+
+[Install]
+WantedBy=multi-user.target
